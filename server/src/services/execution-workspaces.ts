@@ -3,7 +3,7 @@ import { measureRunPhase } from "./execution-preparation-timing.js";
 import { assertTaskWorkspaceAccess, assertTaskWorkspaceSourceProjectAccess } from "./task-workspace-source-access.js";
 import { verifiedRecordedIsolatedRemoteSource, withIsolatedRepositorySourceLock } from "./isolated-remote-workspace-source.js";
 import { expireReconstructableGitWorkspace, hasPendingGitExpiration } from "./git-workspace-expiration.js";
-import { readGitCacheRestoration, restoreGitCacheBase, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
+import { readGitCacheRestoration, restoreGitCacheBase, recoverGitCacheExpirationLocks, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
 import { parseObject } from "../adapters/utils.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { CONTROLLER_PROVISION_COPY_ONLY, workspaceRequiresCopyOnlyProvisioning } from "./workspace-host-provision.js";
@@ -11,6 +11,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { taskWorkspaceSelectableCondition } from "./task-workspace-selection.js";
 import { executionWorkspaceRepositoryService, lockExecutionWorkspaceRootProvenance, preserveExecutionWorkspaceRootProvenance, assertExecutionWorkspaceRootWriteAccess, assertExecutionWorkspaceRootReadAccess, assertIsolatedWorkspaceSourceReadAccess, retainIsolatedWorkspaceSourceAccess, canonicalRepositoryRoot, type IsolatedWorkspaceSourceAccess, type TaskWorkspaceCreationTrustContext } from "./execution-workspace-repositories.js";
 import { forbidden } from "../errors.js";
+import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { taskWorkspaceSelectionSchema, type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@paperclipai/shared";
 import { authorizationService, executionWorkspaceReadSqlCondition, projectReadSqlCondition, issueReadSqlCondition, type AuthorizationActor } from "./authorization.js";
 import type { SQL } from "drizzle-orm";
@@ -1385,7 +1386,7 @@ const WORKSPACE_COMPACTION_TRASH_STALE_MS = 60 * 60 * 1000;
 const WORKSPACE_COMPACTION_TRASH_PURGE_INTERVAL_MS = 30 * 60 * 1000;
 
 export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServiceOptions = {}) {
-  async function resolveSourceWorkspaceStrategy(input: {
+  async function resolveSourceWorkspaceConfiguration(input: {
     companyId: string; issueId?: string | null; assigneeAgentId?: string | null;
     assigneeAdapterOverrides?: unknown; executionWorkspaceSettings?: unknown;
     executionWorkspacePolicy: unknown; typedSelection?: boolean; projectId?: string | null; executionPolicy?: unknown;
@@ -1416,7 +1417,11 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
     const mode = trust.kind === "low_trust_review" && resolvedMode === "shared_workspace" ? "isolated_workspace" : resolvedMode;
     const config = buildExecutionWorkspaceAdapterConfig({ agentConfig: parseObject(agent?.adapterConfig), projectPolicy, issueSettings, mode,
       legacyUseProjectWorkspace: overrides?.useProjectWorkspace ?? null, adapterConfigOverrides: overrides?.adapterConfig });
-    return resolveEffectiveWorkspaceStrategyType(mode, config);
+    return { strategy: resolveEffectiveWorkspaceStrategyType(mode, config), config };
+  }
+
+  async function resolveSourceWorkspaceStrategy(input: Parameters<typeof resolveSourceWorkspaceConfiguration>[0], reader: Db | DbTransaction = db) {
+    return (await resolveSourceWorkspaceConfiguration(input, reader)).strategy;
   }
 
   async function validateSelection(input: { taskCreation?: TaskWorkspaceCreationTrustContext; companyId: string; actor: AuthorizationActor; selection: TaskWorkspaceSelection; issueId?: string | null; parentIssueId?: string | null; assigneeAgentId?: string | null; assigneeUserId?: string | null; assigneeAdapterOverrides?: unknown; projectId?: string | null; executionPolicy?: unknown; preserveImplicitDefaultSettings?: boolean }, reader: Db | DbTransaction = db) {
@@ -1479,7 +1484,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   }
 
   async function selectTaskWorkspace(input: { companyId: string; issueId: string; actor: AuthorizationActor;
-    selection: TaskWorkspaceSelection; expectedBindingRevision: number; requestKey: string }) {
+    selection: TaskWorkspaceSelection; expectedBindingRevision: number; requestKey: string; source?: "recovery" }) {
+    if (input.source === "recovery" && input.actor.type !== "board") throw forbidden("Workspace recovery requires a board actor");
     return db.transaction(async tx => {
       const [task] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId),
         await issueReadSqlCondition(tx, input.actor))).for("update");
@@ -1505,7 +1511,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       }
       if (task.workspaceBindingRevision !== input.expectedBindingRevision) throw conflict("Task workspace binding changed; inspect it before selecting again");
       await validateSelection(input, tx);
-      const intent: TaskWorkspaceIntent = { version: 1, request: { key: input.requestKey, expectedBindingRevision: input.expectedBindingRevision }, selection: input.selection, source: "explicit" };
+      const intent: TaskWorkspaceIntent = { version: 1, request: { key: input.requestKey, expectedBindingRevision: input.expectedBindingRevision }, selection: input.selection, source: input.source ?? "explicit" };
       const nextRevision = task.workspaceBindingRevision + 1;
       await tx.update(issues).set({ workspaceBindingRevision: nextRevision,
         workspacePendingSelection: { version: 1, requestKey: input.requestKey,
@@ -1530,7 +1536,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       const unsettled = await hasPendingTaskWorkspaceRecovery(tx, { ...input, excludeRunId: input.runId });
       if (unsettled) throw conflict("Previous task run still owns workspace recovery; finish recovery before changing its workspace");
       const patch = await validateSelection({ ...input, selection: pending.intent.selection }, tx);
-      await tx.update(issues).set({ ...patch, workspaceSelection: pending.intent, workspacePendingSelection: null,
+      let assigneeAdapterOverrides = task.assigneeAdapterOverrides;
+      if (pending.intent.source === "recovery") {
+        patch.executionWorkspaceSettings = { ...parseObject(task.executionWorkspaceSettings), ...patch.executionWorkspaceSettings };
+        const [source] = await tx.select({ policy: projects.executionWorkspacePolicy }).from(projectWorkspaces)
+          .innerJoin(projects, eq(projects.id, projectWorkspaces.projectId)).where(and(
+            eq(projectWorkspaces.companyId, input.companyId), eq(projectWorkspaces.id, patch.projectWorkspaceId!),
+          ));
+        const { strategy, config } = await resolveSourceWorkspaceConfiguration({ ...input, typedSelection: true,
+          executionWorkspacePolicy: source?.policy, executionWorkspaceSettings: patch.executionWorkspaceSettings }, tx);
+        if (strategy === "git_worktree") {
+          const workspaceStrategy = { ...parseObject(config.workspaceStrategy), type: "git_worktree",
+            existingBranch: null, branchTemplate: "retry-{{issue.id}}" };
+          patch.executionWorkspaceSettings = { ...patch.executionWorkspaceSettings, workspaceStrategy };
+          const adapterConfig = parseObject(assigneeAdapterOverrides?.adapterConfig);
+          if (adapterConfig.workspaceStrategy) {
+            assigneeAdapterOverrides = { ...assigneeAdapterOverrides, adapterConfig: { ...adapterConfig,
+              workspaceStrategy } };
+          }
+        }
+      }
+      await tx.update(issues).set({ ...patch, assigneeAdapterOverrides, workspaceSelection: pending.intent, workspacePendingSelection: null,
         workspaceBindingRevision: task.workspaceBindingRevision + 1, updatedAt: new Date() }).where(eq(issues.id, task.id));
       return true;
     });
@@ -1672,8 +1698,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
   let terminalSweepInProgress = false;
 
   async function listWorkspaceIssueTree(workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">) {
-    if (!workspace.sourceIssueId) return [];
-    return db
+    const sourceIssueId = workspace.sourceIssueId;
+    if (!sourceIssueId) return [];
+    // A read-only lookup: rebuild it after a transient pooled disconnect.
+    return retryIdempotentDatabaseOperation(() => db
       .select({
         id: issues.id,
         status: issues.status,
@@ -1690,7 +1718,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               SELECT ${issues.id}
               FROM ${issues}
               WHERE ${issues.companyId} = ${workspace.companyId}
-                AND ${issues.id} = ${workspace.sourceIssueId}
+                AND ${issues.id} = ${sourceIssueId}
               UNION ALL
               SELECT child.id
               FROM ${issues} child
@@ -1700,15 +1728,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             SELECT id FROM issue_tree
           )
         `,
-      ));
+      )));
   }
 
   async function listDeliveryPullRequestProducts(
     workspace: Pick<ExecutionWorkspaceRow, "companyId" | "sourceIssueId">,
   ) {
-    if (!workspace.sourceIssueId) return [];
+    const sourceIssueId = workspace.sourceIssueId;
+    if (!sourceIssueId) return [];
 
-    return db
+    // A read-only lookup: rebuild it after a transient pooled disconnect.
+    return retryIdempotentDatabaseOperation(() => db
       .select({
         id: issueWorkProducts.id,
         url: issueWorkProducts.url,
@@ -1721,10 +1751,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       .where(and(
         eq(issueWorkProducts.companyId, workspace.companyId),
         eq(issueWorkProducts.type, "pull_request"),
-        eq(issueWorkProducts.issueId, workspace.sourceIssueId),
+        eq(issueWorkProducts.issueId, sourceIssueId),
       ))
       .orderBy(desc(issueWorkProducts.updatedAt))
-      .limit(100);
+      .limit(100));
   }
 
   async function assessDelivery(
@@ -3808,6 +3838,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             return { ok: false, code: "not_reopenable", message: "Execution workspace source changed during reopen" };
           }
         }
+        try { await recoverGitCacheExpirationLocks(row); }
+        catch { return { ok: false, code: "rebuild_failed", message: new GitCacheRestorationFailure().message }; }
         const verifyCopyIdentity = capturedSource && authorizedTarget ? async (sourceCwd: string, targetCwd: string) => {
           if (!capturedSource!.roots.includes(await fs.realpath(sourceCwd))
             || await canonicalRepositoryRoot(targetCwd) !== authorizedTarget) {
@@ -3863,6 +3895,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const realized = await ensurePersistedExecutionWorkspaceAvailable({
             db: tx as unknown as Db,
             resolveGitAuth: gitAuth,
+            persistContentsRestoredAt: async at => {
+              const currentRecipe = nextMetadata.gitCacheRestoration;
+              const updated = await db.update(executionWorkspaces).set({
+                metadata: sql`jsonb_set(${executionWorkspaces.metadata}, '{gitCacheRestoration,contentsRestoredAt}', ${JSON.stringify(at)}::jsonb)`,
+              }).where(and(eq(executionWorkspaces.id, row.id), eq(executionWorkspaces.companyId, row.companyId),
+                sql`${executionWorkspaces.metadata}->'gitCacheRestoration' = ${JSON.stringify(currentRecipe)}::jsonb`))
+                .returning({ id: executionWorkspaces.id });
+              if (updated.length !== 1) throw new GitCacheRestorationFailure();
+              nextMetadata.gitCacheRestoration = { ...currentRecipe as Record<string, unknown>, contentsRestoredAt: at };
+            },
+            prepareRestoredLocalSource: async sourceCwd => {
+              const captured = await assertIsolatedWorkspaceSourceReadAccess(tx as unknown as Db, {
+                companyId: row.companyId, sourceCwd, actor: input.authorizationActor, copyKind: "repository",
+              });
+              const recheck = () => retainIsolatedWorkspaceSourceAccess(tx as unknown as Db, {
+                companyId: row.companyId, sourceCwd, targetCwd: row.cwd!, actor: input.authorizationActor,
+                captured, issueId: issue.id, copyKind: "repository",
+              });
+              await recheck();
+              return recheck;
+            },
             skipHostProvision: trust.kind === "low_trust_review" || copyOnlyProvisioning,
             beforeSourceCopy: verifyCopyIdentity,
             afterSourceCopy: verifyCopyIdentity,
@@ -3969,7 +4022,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         // Keep the refresh guard after reopening so normal preparation cannot
         // advance the saved checkout to upstream HEAD. Its intact branch may now
         // receive newer task commits; the next expiration records a fresh recipe.
-        if (recipe) nextMetadata.gitCacheRestoration = { ...recipe, restoredAt: now().toISOString() };
+        if (recipe) nextMetadata.gitCacheRestoration = { ...nextMetadata.gitCacheRestoration as Record<string, unknown>, restoredAt: now().toISOString() };
         const activeMetadata = setMetadataReopenPendingConsumption(nextMetadata, now());
         await measureRunPhase("workspace.notification", () => notifyTerminalWorkspaceWork(tx, `workspace:${row.id}`));
         const activeRow = await tx

@@ -18,6 +18,23 @@ Agent access: [companion](../agent-access-map/workspaces.md).
 - `files-git`: inspect workspace files and repository state used for the deliverable.
 - `closure`: close/reopen or reconcile through permitted controls without losing work.
 
+For a historical failed export whose exact sandbox was destroyed, the task recovery
+notice offers **Continue from saved sources** to an authorized board operator.
+Select surviving task attachments, record lost work and external action outcomes,
+then rebuild through fresh-session admission. The old failed run remains failed.
+Bounded bootstrap retries retain this decision and recheck their system wake,
+predecessors, saved files and current execution gates before provider startup.
+Later cancelled runs require their own confirmed stop and board file repair.
+Their evidence is preserved with the reconstruction and rechecked before dispatch.
+Stop retains unfinished native files; startup also repairs missing historical
+retention without replaying the cancelled turn.
+Daytona stop-only cleanup confirms retention and accepts an already archived source.
+Cancelled native file recovery can record a verified no-action outcome. Its
+confirmation stays optional and resets when the source changes.
+Retained sandboxes keep their existing export recovery path. Automated coverage:
+[reconstruction](../../server/src/services/native-runtime/native-workspace-reconstruction.test.ts).
+Live staging acceptance remains separate from these regression tests.
+
 ## How to get to it (user POV)
 
 ### `task-workspace`
@@ -38,6 +55,12 @@ Automated: [workspace card](../../ui/src/components/IssueWorkspaceCard.test.tsx)
 
 Manual: Run a task that writes a small file, follow the bound workspace, and inspect the file and revision. Reload and verify links still refer to the same workspace, not another checkout or a stale run.
 
+For slow source preparation, configure a short PostgreSQL idle-transaction
+timeout in a disposable instance. Hold preparation beyond that interval and
+verify it retains its source lock, rejects competing preparation, and leaves
+ordinary reads available. The [source-lock regression](../../server/src/services/isolated-remote-workspace-source-lock.test.ts)
+uses real PostgreSQL; it does not prove provider startup or deployed recovery.
+
 For fresh standard-trust tasks using an implicit repository default, create a
 disposable project checkout whose shared Git storage overlaps a private task
 workspace. Verify that source admission creates a separate checkout from the
@@ -56,6 +79,20 @@ source choices changed during preparation must retain the denial. The
 and [preparation tests](../../server/src/services/heartbeat/workspace-preparation.test.ts)
 exercise the real Git isolation and lifecycle guards. They do not qualify live
 remote credentials or a provider deployment.
+
+For a task reusing the shared project checkout, add a private task worktree that
+the assigned agent cannot read. Continue the shared task and verify the
+task offers **Retry**, without a workspace picker or repair checklist. Before the
+click, no agent turn or automatic failure retry may start. Click Retry and verify
+that normal admission selects an isolated checkout from the configured remote,
+preserves the agent and environment, and leaves both tasks' old files intact.
+Private local branches and commits must not enter the new checkout. Repeated
+clicks request one retry; a paused project or pending approval must still block it.
+Repeat with fixed project branches, an existing task branch, and adapter branch
+overrides; Retry must choose a fresh branch while preserving setup and model settings.
+Add enough later comments to page the original notice out of view, reload, and
+verify Retry remains above the composer. This control does
+not depend on the workspace picker's visibility setting.
 
 For reconstructable Git expiration, finish a disposable task tree, run the
 internal lifecycle sweep after its 24-hour grace, and inspect candidate/reclaimed
