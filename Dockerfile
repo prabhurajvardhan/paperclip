@@ -49,11 +49,11 @@ COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 COPY scripts/ scripts/
-
+COPY packages/paperclip-runner/scripts/ packages/paperclip-runner/scripts/
 
 # CI owns repository lock updates. Resolve manifest changes in the image's
 # private build tree, then install from that exact generated lock.
-RUN pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile && pnpm install --no-frozen-lockfile
+RUN pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile && pnpm install --no-frozen-lockfile --ignore-scripts
 
 
 FROM base AS rust-toolchain
