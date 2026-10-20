@@ -51,7 +51,8 @@ COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
 # CI owns repository lock updates. Resolve manifest changes in the image's
 # private build tree, then install from that exact generated lock.
-RUN pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile && pnpm install --frozen-lockfile
+RUN pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile && pnpm install --no-frozen-lockfile
+
 
 FROM base AS rust-toolchain
 WORKDIR /app
